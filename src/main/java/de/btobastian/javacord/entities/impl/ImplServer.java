@@ -18,14 +18,44 @@
  */
 package de.btobastian.javacord.entities.impl;
 
+import java.awt.image.BufferedImage;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
+
+import de.btobastian.javacord.Javacord;
+import de.btobastian.javacord.utils.SnowflakeUtil;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.slf4j.Logger;
+
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.mashape.unirest.http.HttpResponse;
 import com.mashape.unirest.http.JsonNode;
 import com.mashape.unirest.http.Unirest;
+
 import de.btobastian.javacord.ImplDiscordAPI;
-import de.btobastian.javacord.entities.*;
+import de.btobastian.javacord.entities.Channel;
+import de.btobastian.javacord.entities.CustomEmoji;
+import de.btobastian.javacord.entities.Invite;
+import de.btobastian.javacord.entities.Region;
+import de.btobastian.javacord.entities.Server;
+import de.btobastian.javacord.entities.User;
+import de.btobastian.javacord.entities.UserStatus;
+import de.btobastian.javacord.entities.VoiceChannel;
 import de.btobastian.javacord.entities.permissions.Ban;
 import de.btobastian.javacord.entities.permissions.Permissions;
 import de.btobastian.javacord.entities.permissions.Role;
@@ -34,23 +64,19 @@ import de.btobastian.javacord.entities.permissions.impl.ImplPermissions;
 import de.btobastian.javacord.entities.permissions.impl.ImplRole;
 import de.btobastian.javacord.listener.channel.ChannelCreateListener;
 import de.btobastian.javacord.listener.role.RoleCreateListener;
-import de.btobastian.javacord.listener.server.*;
+import de.btobastian.javacord.listener.server.ServerChangeNameListener;
+import de.btobastian.javacord.listener.server.ServerLeaveListener;
+import de.btobastian.javacord.listener.server.ServerMemberBanListener;
+import de.btobastian.javacord.listener.server.ServerMemberRemoveListener;
+import de.btobastian.javacord.listener.server.ServerMemberUnbanListener;
 import de.btobastian.javacord.listener.user.UserRoleAddListener;
 import de.btobastian.javacord.listener.user.UserRoleRemoveListener;
 import de.btobastian.javacord.listener.voicechannel.VoiceChannelCreateListener;
 import de.btobastian.javacord.utils.LoggerUtil;
 import de.btobastian.javacord.utils.ratelimits.RateLimitType;
-import org.json.JSONArray;
-import org.json.JSONObject;
-import org.slf4j.Logger;
 
-import java.awt.image.BufferedImage;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
+import javax.imageio.ImageIO;
+import javax.net.ssl.HttpsURLConnection;
 
 /**
  * The implementation of the server interface.
@@ -78,6 +104,7 @@ public class ImplServer implements Server {
     private int memberCount;
     private final boolean large;
     private String ownerId;
+    private String iconHash;
 
     /**
      * Creates a new instance of this class.
@@ -108,11 +135,11 @@ public class ImplServer implements Server {
         JSONArray channels = data.getJSONArray("channels");
         for (int i = 0; i < channels.length(); i++) {
             JSONObject channelJson = channels.getJSONObject(i);
-            String type = channelJson.getString("type");
-            if (type.equals("text")) {
+            int type = channelJson.getInt("type");
+            if (type == 0) {
                 new ImplChannel(channels.getJSONObject(i), this, api);
             }
-            if (type.equals("voice")) {
+            if (type == 2) {
                 new ImplVoiceChannel(channels.getJSONObject(i), this, api);
             }
         }
@@ -137,6 +164,30 @@ public class ImplServer implements Server {
             }
         }
 
+        JSONArray voiceStates = new JSONArray();
+        if (data.has("voice_states")) {
+            voiceStates = data.getJSONArray("voice_states");
+        }
+        for (int i = 0; i < voiceStates.length(); ++i) {
+            JSONObject voiceState = voiceStates.getJSONObject(i);
+            ImplUser user = null;
+            try {
+                user = (ImplUser) this.members.get(voiceState.getString("user_id"));
+            } catch (JSONException | NullPointerException e) {
+                continue;
+            }
+            VoiceChannel channel = null;
+            try {
+                channel = this.voiceChannels.get(voiceState.getString("channel_id"));
+            } catch (JSONException | NullPointerException e) {
+                continue;
+            }
+            if (channel != null) {
+                ((ImplVoiceChannel) channel).addConnectedUser(user);
+                user.setVoiceChannel(channel);
+            }
+        }
+
         JSONArray presences = new JSONArray();
         if (data.has("presences")) {
             presences = data.getJSONArray("presences");
@@ -154,6 +205,8 @@ public class ImplServer implements Server {
                 ((ImplUser) user).setStatus(status);
             }
         }
+        
+        this.iconHash = data.isNull("icon") ? null : data.getString("icon");
 
         api.getServerMap().put(id, this);
     }
@@ -161,6 +214,11 @@ public class ImplServer implements Server {
     @Override
     public String getId() {
         return id;
+    }
+
+    @Override
+    public Calendar getCreationDate() {
+        return SnowflakeUtil.parseDate(id);
     }
 
     @Override
@@ -174,7 +232,7 @@ public class ImplServer implements Server {
             @Override
             public Void call() throws Exception {
                 logger.debug("Trying to delete server {}", ImplServer.this);
-                HttpResponse<JsonNode> response = Unirest.delete("https://discordapp.com/api/guilds/" + id)
+                HttpResponse<JsonNode> response = Unirest.delete("https://discordapp.com/api/v6/guilds/" + id)
                         .header("authorization", api.getToken())
                         .asJson();
                 api.checkResponse(response);
@@ -208,7 +266,7 @@ public class ImplServer implements Server {
             public Void call() throws Exception {
                 logger.debug("Trying to leave server {}", ImplServer.this);
                 HttpResponse<JsonNode> response = Unirest
-                        .delete("https://discordapp.com/api/users/@me/guilds/" + id)
+                        .delete("https://discordapp.com/api/v6/users/@me/guilds/" + id)
                         .header("authorization", api.getToken())
                         .asJson();
                 api.checkResponse(response);
@@ -375,7 +433,7 @@ public class ImplServer implements Server {
                     public Invite[] call() throws Exception {
                         logger.debug("Trying to get invites for server {}", ImplServer.this);
                         HttpResponse<JsonNode> response = Unirest
-                                .get("https://discordapp.com/api/guilds/" + getId() + "/invites")
+                                .get("https://discordapp.com/api/v6/guilds/" + getId() + "/invites")
                                 .header("authorization", api.getToken())
                                 .asJson();
                         api.checkResponse(response);
@@ -405,7 +463,7 @@ public class ImplServer implements Server {
             public Void call() throws Exception {
                 logger.debug("Trying to update roles in server {} (amount: {})", ImplServer.this, roles.length);
                 HttpResponse<JsonNode> response = Unirest
-                        .patch("https://discordapp.com/api/guilds/" + getId() + "/members/" + user.getId())
+                        .patch("https://discordapp.com/api/v6/guilds/" + getId() + "/members/" + user.getId())
                         .header("authorization", api.getToken())
                         .header("Content-Type", "application/json")
                         .body(new JSONObject().put("roles", roleIds).toString())
@@ -489,7 +547,7 @@ public class ImplServer implements Server {
                 logger.debug("Trying to ban an user from server {} (user id: {}, delete days: {})",
                         ImplServer.this, userId, deleteDays);
                 HttpResponse<JsonNode> response = Unirest
-                        .put("https://discordapp.com/api/guilds/" + getId() + "/bans/" + userId
+                        .put("https://discordapp.com/api/v6/guilds/" + getId() + "/bans/" + userId
                                 + "?delete-message-days=" + deleteDays)
                         .header("authorization", api.getToken())
                         .asJson();
@@ -528,7 +586,7 @@ public class ImplServer implements Server {
             public Void call() throws Exception {
                 logger.debug("Trying to unban an user from server {} (user id: {})", ImplServer.this, userId);
                 HttpResponse<JsonNode> response = Unirest
-                        .delete("https://discordapp.com/api/guilds/" + getId() + "/bans/" + userId)
+                        .delete("https://discordapp.com/api/v6/guilds/" + getId() + "/bans/" + userId)
                         .header("authorization", api.getToken())
                         .asJson();
                 api.checkResponse(response);
@@ -568,7 +626,7 @@ public class ImplServer implements Server {
                     public Ban[] call() throws Exception {
                         logger.debug("Trying to get bans for server {}", ImplServer.this);
                         HttpResponse<JsonNode> response = Unirest
-                                .get("https://discordapp.com/api/guilds/" + getId() + "/bans")
+                                .get("https://discordapp.com/api/v6/guilds/" + getId() + "/bans")
                                 .header("authorization", api.getToken())
                                 .asJson();
                         api.checkResponse(response);
@@ -600,7 +658,7 @@ public class ImplServer implements Server {
             public Void call() throws Exception {
                 logger.debug("Trying to kick an user from server {} (user id: {})", ImplServer.this);
                 HttpResponse<JsonNode> response = Unirest
-                        .delete("https://discordapp.com/api/guilds/"+ getId() + "/members/" + userId)
+                        .delete("https://discordapp.com/api/v6/guilds/"+ getId() + "/members/" + userId)
                         .header("authorization", api.getToken())
                         .asJson();
                 api.checkResponse(response);
@@ -643,7 +701,7 @@ public class ImplServer implements Server {
             public Role call() throws Exception {
                 logger.debug("Trying to create a role in server {}", ImplServer.this);
                 HttpResponse<JsonNode> response = Unirest
-                        .post("https://discordapp.com/api/guilds/" + getId() + "/roles")
+                        .post("https://discordapp.com/api/v6/guilds/" + getId() + "/roles")
                         .header("authorization", api.getToken())
                         .asJson();
                 api.checkResponse(response);
@@ -710,7 +768,7 @@ public class ImplServer implements Server {
                         ImplServer.this, newName, getName(), newRegion == null ? "null" : newRegion.getKey(),
                         getRegion().getKey());
                 HttpResponse<JsonNode> response = Unirest
-                        .patch("https://discordapp.com/api/guilds/" + getId())
+                        .patch("https://discordapp.com/api/v6/guilds/" + getId())
                         .header("authorization", api.getToken())
                         .header("Content-Type", "application/json")
                         .body(params.toString())
@@ -784,7 +842,7 @@ public class ImplServer implements Server {
                 logger.debug("Trying to authorize bot with application id {} and permissions {}",
                         applicationId, permissions);
                 HttpResponse<JsonNode> response = Unirest
-                        .post("https://discordapp.com/api/oauth2/authorize?client_id=" + applicationId + "&scope=bot")
+                        .post("https://discordapp.com/api/v6/oauth2/authorize?client_id=" + applicationId + "&scope=bot")
                         .routeParam("id", applicationId)
                         .header("authorization", api.getToken())
                         .header("Content-Type", "application/json")
@@ -839,8 +897,12 @@ public class ImplServer implements Server {
             @Override
             public Void call() throws Exception {
                 logger.debug("Trying to update nickname of user {} to {}", user, nickname);
+                String url = "https://discordapp.com/api/v6/guilds/" + getId() + "/members/" + user.getId();
+                if (user.isYourself()) {
+                    url = "https://discordapp.com/api/v6/guilds/" + getId() + "/members/@me/nick";
+                }
                 HttpResponse<JsonNode> response = Unirest
-                        .patch("https://discordapp.com/api/guilds/" + getId() + "/members/" + user.getId())
+                        .patch(url)
                         .header("authorization", api.getToken())
                         .header("Content-Type", "application/json")
                         .body(new JSONObject()
@@ -853,6 +915,75 @@ public class ImplServer implements Server {
                 return null;
             }
         });
+    }
+
+    @Override
+    public URL getIconUrl() {
+        if (iconHash == null) {
+            return null;
+        }
+        try {
+            return new URL("https://cdn.discordapp.com/icons/" + id + "/" + iconHash + ".png");
+        } catch (MalformedURLException e) {
+            logger.warn("Seems like the url of the icon is malformed! Please contact the developer!", e);
+            return null;
+        }
+    }
+
+    public Future<byte[]> getIconAsByteArray() {
+        ListenableFuture<byte[]> future =
+                api.getThreadPool().getListeningExecutorService().submit(new Callable<byte[]>() {
+                    @Override
+                    public byte[] call() throws Exception {
+                        logger.debug("Trying to get icon from server {}", ImplServer.this);
+                        if (iconHash == null) {
+                            logger.debug("Server {} has default icon. Returning empty array!", ImplServer.this);
+                            return new byte[0];
+                        }
+                        URL url = getIconUrl();
+                        HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+                        conn.setRequestMethod("GET");
+                        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                        conn.setRequestProperty("User-Agent", Javacord.USER_AGENT);
+                        InputStream in = new BufferedInputStream(conn.getInputStream());
+                        ByteArrayOutputStream out = new ByteArrayOutputStream();
+                        byte[] buf = new byte[1024];
+                        int n;
+                        while (-1 != (n = in.read(buf))) {
+                            out.write(buf, 0, n);
+                        }
+                        out.close();
+                        in.close();
+                        byte[] avatar = out.toByteArray();
+                        logger.debug("Got icon from server {} (size: {})", ImplServer.this, avatar.length);
+                        return avatar;
+                    }
+                });
+        return future;
+    }
+
+    @Override
+    public Future<byte[]> getIcon() {
+        return getIcon(null);
+    }
+
+    @Override
+    public Future<byte[]> getIcon(FutureCallback<byte[]> callback) {
+        ListenableFuture<byte[]> future =
+                api.getThreadPool().getListeningExecutorService().submit(new Callable<byte[]>() {
+                    @Override
+                    public byte[] call() throws Exception {
+                        byte[] imageAsBytes = getIconAsByteArray().get();
+                        if (imageAsBytes.length == 0) {
+                            return null;
+                        }
+                        return imageAsBytes;
+                    }
+                });
+        if (callback != null) {
+            Futures.addCallback(future, callback);
+        }
+        return future;
     }
 
     /**
@@ -889,6 +1020,15 @@ public class ImplServer implements Server {
      */
     public void removeMember(User user) {
         members.remove(user.getId());
+        for (Role role : getRoles()) {
+            ((ImplRole) role).removeUserNoUpdate(user);
+        }
+        for (Channel channel : getChannels()) {
+            ((ImplChannel) channel).removeOverwrittenPermissions(user);
+        }
+        for (VoiceChannel channel : getVoiceChannels()) {
+            ((ImplVoiceChannel) channel).removeOverwrittenPermissions(user);
+        }
     }
 
     /**
@@ -1010,6 +1150,24 @@ public class ImplServer implements Server {
     }
 
     /**
+     * Gets the icon hash of the server.
+     *
+     * @return The icon hash of the server.
+     */
+    public String getIconHash() {
+        return this.iconHash;
+    }
+
+    /**
+     * Sets the icon hash of the server.
+     *
+     * @param hash The hash to use.
+     */
+    public void setIconHash(String hash) {
+        this.iconHash = hash;
+    }
+
+    /**
      * Creates a new channel.
      *
      * @param name The name of the channel.
@@ -1020,7 +1178,7 @@ public class ImplServer implements Server {
     private Object createChannelBlocking(String name, boolean voice) throws Exception {
         logger.debug("Trying to create channel in server {} (name: {}, voice: {})", ImplServer.this, name, voice);
         JSONObject param = new JSONObject().put("name", name).put("type", voice ? "voice" : "text");
-        HttpResponse<JsonNode> response = Unirest.post("https://discordapp.com/api/guilds/" + id + "/channels")
+        HttpResponse<JsonNode> response = Unirest.post("https://discordapp.com/api/v6/guilds/" + id + "/channels")
                 .header("authorization", api.getToken())
                 .header("Content-Type", "application/json")
                 .body(param.toString())
@@ -1043,5 +1201,5 @@ public class ImplServer implements Server {
     public int hashCode() {
         return getId().hashCode();
     }
-
+    
 }

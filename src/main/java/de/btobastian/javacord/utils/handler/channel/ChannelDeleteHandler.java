@@ -53,15 +53,11 @@ public class ChannelDeleteHandler extends PacketHandler {
 
     @Override
     public void handle(JSONObject packet) {
-        boolean isPrivate = packet.getBoolean("is_private");
-        if (isPrivate) {
-            return; // TODO ignored atm
-        }
-        Server server = api.getServerById(packet.getString("guild_id"));
-        if (packet.getString("type").equals("text")) {
-            handleServerTextChannel(packet, server);
-        } else {
-            handleServerVoiceChannel(packet, server);
+        int type = packet.getInt("type");
+        if (type == 0) {
+            handleServerTextChannel(packet, api.getServerById(packet.getString("guild_id")));
+        } else if (type == 2) {
+            handleServerVoiceChannel(packet, api.getServerById(packet.getString("guild_id")));
         }
     }
 
@@ -73,6 +69,9 @@ public class ChannelDeleteHandler extends PacketHandler {
      */
     private void handleServerTextChannel(JSONObject packet, Server server) {
         final Channel channel = server.getChannelById(packet.getString("id"));
+        if (channel == null) {
+            return;
+        }
         ((ImplServer) server).removeChannel(channel);
         listenerExecutorService.submit(new Runnable() {
             @Override
@@ -99,6 +98,9 @@ public class ChannelDeleteHandler extends PacketHandler {
      */
     private void handleServerVoiceChannel(JSONObject packet, Server server) {
         final VoiceChannel channel = server.getVoiceChannelById(packet.getString("id"));
+        if (channel == null) {
+            return;
+        }
         ((ImplServer) server).removeVoiceChannel(channel);
         listenerExecutorService.submit(new Runnable() {
             @Override

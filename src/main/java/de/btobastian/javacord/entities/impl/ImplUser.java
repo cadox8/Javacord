@@ -30,6 +30,7 @@ import de.btobastian.javacord.Javacord;
 import de.btobastian.javacord.entities.Server;
 import de.btobastian.javacord.entities.User;
 import de.btobastian.javacord.entities.UserStatus;
+import de.btobastian.javacord.entities.VoiceChannel;
 import de.btobastian.javacord.entities.message.Message;
 import de.btobastian.javacord.entities.message.MessageHistory;
 import de.btobastian.javacord.entities.message.MessageReceiver;
@@ -38,6 +39,7 @@ import de.btobastian.javacord.entities.message.impl.ImplMessage;
 import de.btobastian.javacord.entities.message.impl.ImplMessageHistory;
 import de.btobastian.javacord.entities.permissions.Role;
 import de.btobastian.javacord.utils.LoggerUtil;
+import de.btobastian.javacord.utils.SnowflakeUtil;
 import de.btobastian.javacord.utils.ratelimits.RateLimitType;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -74,6 +76,7 @@ public class ImplUser implements User {
     private final String discriminator;
     private final boolean bot;
     private UserStatus status = UserStatus.OFFLINE;
+    private VoiceChannel voiceChannel = null;
 
     /**
      * Creates a new instance of this class.
@@ -107,6 +110,11 @@ public class ImplUser implements User {
     }
 
     @Override
+    public Calendar getCreationDate() {
+        return SnowflakeUtil.parseDate(id);
+    }
+
+    @Override
     public String getName() {
         return name;
     }
@@ -134,7 +142,7 @@ public class ImplUser implements User {
         try {
             logger.debug("Sending typing state to user {}", this);
             HttpResponse<JsonNode> response = Unirest
-                    .post("https://discordapp.com/api/channels/" + getUserChannelIdBlocking() + "/typing")
+                    .post("https://discordapp.com/api/v6/channels/" + getUserChannelIdBlocking() + "/typing")
                     .header("authorization", api.getToken())
                     .asJson();
             api.checkResponse(response);
@@ -166,7 +174,7 @@ public class ImplUser implements User {
                             logger.debug("User {} seems to have no avatar. Returning empty array!", ImplUser.this);
                             return new byte[0];
                         }
-                        URL url = new URL("https://discordapp.com/api/users/" + id + "/avatars/" + avatarId + ".jpg");
+                        URL url = new URL("https://discordapp.com/api/v6/users/" + id + "/avatars/" + avatarId + ".jpg");
                         HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
                         conn.setRequestMethod("GET");
                         conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -222,7 +230,7 @@ public class ImplUser implements User {
             return null;
         }
         try {
-            return new URL("https://discordapp.com/api/users/" + id + "/avatars/" + avatarId + ".jpg");
+            return new URL("https://discordapp.com/api/v6/users/" + id + "/avatars/" + avatarId + ".jpg");
         } catch (MalformedURLException e) {
             logger.warn("Seems like the url of the avatar is malformed! Please contact the developer!", e);
             return null;
@@ -330,7 +338,7 @@ public class ImplUser implements User {
                             body.put("nonce", nonce);
                         }
                         HttpResponse<JsonNode> response =
-                                Unirest.post("https://discordapp.com/api/channels/"
+                                Unirest.post("https://discordapp.com/api/v6/channels/"
                                         + getUserChannelIdBlocking() + "/messages")
                                         .header("authorization", api.getToken())
                                         .header("content-type", "application/json")
@@ -384,7 +392,7 @@ public class ImplUser implements User {
                                 ImplUser.this, file.getName(), comment);
                         api.checkRateLimit(null, RateLimitType.PRIVATE_MESSAGE, null, null);
                         MultipartBody body = Unirest
-                                .post("https://discordapp.com/api/channels/" + getUserChannelIdBlocking() + "/messages")
+                                .post("https://discordapp.com/api/v6/channels/" + getUserChannelIdBlocking() + "/messages")
                                 .header("authorization", api.getToken())
                                 .field("file", file);
                         if (comment != null) {
@@ -421,7 +429,7 @@ public class ImplUser implements User {
                                 ImplUser.this, comment);
                         api.checkRateLimit(null, RateLimitType.PRIVATE_MESSAGE, null, null);
                         MultipartBody body = Unirest
-                                .post("https://discordapp.com/api/channels/" + getUserChannelIdBlocking() + "/messages")
+                                .post("https://discordapp.com/api/v6/channels/" + getUserChannelIdBlocking() + "/messages")
                                 .header("authorization", api.getToken())
                                 .field("file", inputStream, filename);
                         if (comment != null) {
@@ -593,7 +601,7 @@ public class ImplUser implements User {
             }
             logger.debug("Trying to get channel id of user {}", ImplUser.this);
             HttpResponse<JsonNode> response = Unirest
-                    .post("https://discordapp.com/api/users/" + api.getYourself().getId() + "/channels")
+                    .post("https://discordapp.com/api/v6/users/" + api.getYourself().getId() + "/channels")
                     .header("authorization", api.getToken())
                     .header("Content-Type", "application/json")
                     .body(new JSONObject().put("recipient_id", id).toString())
@@ -643,6 +651,20 @@ public class ImplUser implements User {
      */
     public void setAvatarId(String avatarId) {
         this.avatarId = avatarId;
+    }
+    
+    /**
+     * Sets the {@link VoiceChannel} the user is currently in (null for none).
+     *
+     * @param voiceChannel The voice channel the user is in.
+     */
+    public void setVoiceChannel(VoiceChannel voiceChannel) {
+        this.voiceChannel = voiceChannel;
+    }
+    
+    @Override
+    public final VoiceChannel getVoiceChannel() {
+        return this.voiceChannel;
     }
 
     @Override

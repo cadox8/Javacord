@@ -72,6 +72,14 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
 
     private boolean heartbeatAckReceived = false;
 
+    private boolean reconnect = true;
+
+    // We allow 5 reconnects per 5 minutes.
+    // This limit should never be hit under normal conditions, but prevent reconnect loops.
+    private Queue<Long> ratelimitQueue = new LinkedList<>();
+    private int reconnectAttempts = 5;
+    private int ratelimitResetIntervalInSeconds = 5*60;
+
     public DiscordWebsocketAdapter(ImplDiscordAPI api, String gateway) {
         this.api = api;
         this.gateway = gateway;
@@ -79,6 +87,14 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
         registerHandlers();
 
         connect();
+    }
+
+    /**
+     * Disconnects from the websocket.
+     */
+    public void disconnect() {
+        reconnect = false;
+        websocket.sendClose(1000);
     }
 
     private void connect() {
@@ -89,7 +105,7 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
             logger.warn("An error occurred while setting ssl context", e);
         }
         try {
-            websocket = factory.createSocket(gateway + "?encoding=json&v=5");
+            websocket = factory.createSocket(gateway + "?encoding=json&v=6");
             websocket.addHeader("Accept-Encoding", "gzip");
             websocket.addListener(this);
             websocket.connect();
@@ -131,13 +147,24 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
             ready.set(false);
             return;
         }
+
         // Reconnect
         if (heartbeatTimer != null) {
             heartbeatTimer.cancel();
             heartbeatTimer = null;
         }
 
-        connect();
+        if (reconnect) {
+            ratelimitQueue.offer(System.currentTimeMillis());
+            if (ratelimitQueue.size() > reconnectAttempts) {
+                long timestamp = ratelimitQueue.poll();
+                if (System.currentTimeMillis() - (1000*ratelimitResetIntervalInSeconds) < timestamp) {
+                    logger.error("Websocket connection failed more than {} times in the last {} seconds! Stopping reconnecting.", reconnectAttempts, ratelimitResetIntervalInSeconds);
+                    return;
+                }
+            }
+            connect();
+        }
     }
 
     @Override
@@ -170,16 +197,16 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
                     sessionId = packet.getJSONObject("d").getString("session_id");
                     if (api.isWaitingForServersOnStartup()) {
                         // Discord sends us GUILD_CREATE packets after logging in. We will wait for them.
-                        api.getThreadPool().getExecutorService().submit(new Runnable() {
+                        api.getThreadPool().getSingleThreadExecutorService("startupWait").submit(new Runnable() {
                             @Override
                             public void run() {
                                 int amount = api.getServers().size();
                                 for (;;) {
                                     try {
-                                        Thread.sleep(2000);
+                                        Thread.sleep(1500);
                                     } catch (InterruptedException ignored) { }
                                     if (api.getServers().size() <= amount) {
-                                        break; // two seconds without new servers becoming available
+                                        break; // 1.5 without new servers becoming available
                                     }
                                     amount = api.getServers().size();
                                 }
@@ -404,18 +431,40 @@ public class DiscordWebsocketAdapter extends WebSocketAdapter {
         logger.debug("Updating status (game: {}, idle: {})", api.getGame() == null ? "none" : api.getGame(), api.isIdle());
         JSONObject game = new JSONObject();
         game.put("name", api.getGame() == null ? JSONObject.NULL : api.getGame());
+        game.put("type", api.getStreamingUrl() == null ? 0 : 1);
         if (api.getStreamingUrl() != null) {
-            game.put("url", api.getStreamingUrl()).put("type", 1);
+            game.put("url", api.getStreamingUrl());
         }
         JSONObject updateStatus = new JSONObject()
                 .put("op", 3)
                 .put("d", new JSONObject()
+                        .put("status", "online")
+                        .put("afk", false)
                         .put("game", game)
-                        .put("idle_since", api.isIdle() ? 1 : JSONObject.NULL));
+                        .put("since", api.isIdle() ? 1 : JSONObject.NULL));
+        logger.debug(updateStatus.toString(2));
         websocket.sendText(updateStatus.toString());
     }
 
-    /* === ERROR LOGGING === */
+    /**
+     * Sets the reconnect reset interval in seconds.
+     *
+     * @param ratelimitResetIntervalInSeconds The reconnect reset interval in seconds.
+     */
+    public void setRatelimitResetIntervalInSeconds(int ratelimitResetIntervalInSeconds) {
+        this.ratelimitResetIntervalInSeconds = ratelimitResetIntervalInSeconds;
+    }
+
+    /**
+     * Sets the maximum reconnect attempts.
+     *
+     * @param reconnectAttempts The maximum reconnect attempts.
+     */
+    public void setReconnectAttempts(int reconnectAttempts) {
+        this.reconnectAttempts = reconnectAttempts;
+    }
+
+/* === ERROR LOGGING === */
 
     @Override
     public void onError(WebSocket websocket, WebSocketException cause) throws Exception {
